@@ -13,31 +13,29 @@ SPACING = 1.0
 class EMFieldApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Photon CA — Directional Emission & Propagation")
+        self.setWindowTitle("Photon CA — Directional Emission & Reset")
         self.resize(1400, 800)
 
         # Total number of cells
         N = GRID_SIZE**3
 
-        # State arrays: electric bit, magnetic bit, and direction vector (dx, dy, dz)
+        # State arrays
         self.electric = np.zeros(N, dtype=int)
         self.magnetic = np.zeros(N, dtype=int)
         self.direction = np.zeros((N, 3), dtype=int)
 
-        # History for oscilloscope plots
+        # History for plots
         self.e_history = []
         self.m_history = []
 
-        # Precompute point coordinates
+        # Precompute point coordinates and cloud
         half = GRID_SIZE // 2
         coords = np.indices((GRID_SIZE,)*3).reshape(3, -1).T
         pts = (coords - half) * SPACING
         self.cloud = pv.PolyData(pts)
-
-        # Center index for history plots
         self.center_idx = np.ravel_multi_index((half,)*3, (GRID_SIZE,)*3)
 
-        # Build UI layouts
+        # Layouts
         main_layout = QtWidgets.QHBoxLayout()
         views_layout = QtWidgets.QVBoxLayout()
         controls_layout = QtWidgets.QVBoxLayout()
@@ -46,11 +44,7 @@ class EMFieldApp(QtWidgets.QMainWindow):
         self.e3d = QtInteractor()
         self.m3d = QtInteractor()
         self.o3d = QtInteractor()
-
-        # Enable point-picking for injection in electric view
         self.e3d.enable_point_picking(self.inject_electric, show_message=False)
-
-        # Add viewers to layout
         views_layout.addWidget(self.e3d.interactor)
         views_layout.addWidget(self.m3d.interactor)
         views_layout.addWidget(self.o3d.interactor)
@@ -63,15 +57,16 @@ class EMFieldApp(QtWidgets.QMainWindow):
         controls_layout.addWidget(self.canv_m)
         controls_layout.addWidget(self.canv_o)
 
-        # Injection by UI controls
+        # Injection via UI
         inj_layout = QtWidgets.QHBoxLayout()
         self.spin_x = QtWidgets.QSpinBox(); self.spin_x.setRange(-half, half)
         self.spin_y = QtWidgets.QSpinBox(); self.spin_y.setRange(-half, half)
         self.spin_z = QtWidgets.QSpinBox(); self.spin_z.setRange(-half, half)
         inj_btn = QtWidgets.QPushButton("Inject (UI)")
         inj_btn.clicked.connect(self.inject_ui)
-        for label, spin in zip(("X","Y","Z"), (self.spin_x, self.spin_y, self.spin_z)):
-            inj_layout.addWidget(QtWidgets.QLabel(label)); inj_layout.addWidget(spin)
+        for lbl, sp in zip(("X","Y","Z"), (self.spin_x, self.spin_y, self.spin_z)):
+            inj_layout.addWidget(QtWidgets.QLabel(lbl))
+            inj_layout.addWidget(sp)
         inj_layout.addWidget(inj_btn)
         controls_layout.addLayout(inj_layout)
 
@@ -85,107 +80,106 @@ class EMFieldApp(QtWidgets.QMainWindow):
         debug_btn.clicked.connect(self.debug_values)
         controls_layout.addWidget(debug_btn)
 
-        # Assemble main window
+        # Reset button
+        reset_btn = QtWidgets.QPushButton("Reset")
+        reset_btn.clicked.connect(self.reset)
+        controls_layout.addWidget(reset_btn)
+
+        # Assemble window
         container = QtWidgets.QWidget()
         main_layout.addLayout(views_layout, 3)
         main_layout.addLayout(controls_layout, 2)
         container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-        # Initial render and plot
+        # Initial draw
         self.update_views()
         self.update_plots()
 
     def inject_electric(self, pick_point):
-        """Inject a single electric bit at picked location with random direction."""
-        # Find nearest cell index
         idx = np.argmin(np.linalg.norm(self.cloud.points - pick_point, axis=1))
-        # Reset state
-        self.electric[:] = 0
-        self.magnetic[:] = 0
-        # Set electric bit
+        self._reset_fields()
         self.electric[idx] = 1
-        # Choose random cardinal direction for the photon
-        offsets = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
-        self.direction[idx] = random.choice(offsets)
-        # Refresh views and plots
+        self.direction[idx] = random.choice(
+            [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+        )
         self.update_views()
         self.update_plots()
 
     def inject_ui(self):
-        """Inject via UI spinbox coordinates."""
         half = GRID_SIZE // 2
         x = self.spin_x.value() + half
         y = self.spin_y.value() + half
         z = self.spin_z.value() + half
-        idx = np.ravel_multi_index((x, y, z), (GRID_SIZE,)*3)
-        self.electric[:] = 0
-        self.magnetic[:] = 0
+        idx = np.ravel_multi_index((x,y,z), (GRID_SIZE,)*3)
+        self._reset_fields()
         self.electric[idx] = 1
-        offsets = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
-        self.direction[idx] = random.choice(offsets)
+        self.direction[idx] = random.choice(
+            [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+        )
         self.update_views()
         self.update_plots()
 
     def step(self):
-        """Move the single photon bit along its direction, flipping E↔B."""
         n = GRID_SIZE
-        coords = np.indices((n, n, n)).reshape(3, -1).T
-
+        coords = np.indices((n,n,n)).reshape(3,-1).T
         newE = np.zeros_like(self.electric)
         newB = np.zeros_like(self.magnetic)
         newDir = np.zeros_like(self.direction)
 
         occupied = np.nonzero(self.electric | self.magnetic)[0]
         for idx in occupied:
-            x, y, z = coords[idx]
-            dx, dy, dz = self.direction[idx]
-            # Compute target with wrap-around
-            xt, yt, zt = (x + dx) % n, (y + dy) % n, (z + dz) % n
-            tidx = np.ravel_multi_index((xt, yt, zt), (n, n, n))
-            # Flip field bit at target
+            x,y,z = coords[idx]
+            dx,dy,dz = self.direction[idx]
+            xt,yt,zt = (x+dx)%n, (y+dy)%n, (z+dz)%n
+            tidx = np.ravel_multi_index((xt,yt,zt),(n,n,n))
             if self.electric[idx]:
                 newB[tidx] = 1
             else:
                 newE[tidx] = 1
-            # Carry direction forward
-            newDir[tidx] = (dx, dy, dz)
+            newDir[tidx] = (dx,dy,dz)
 
         self.electric[:] = newE
         self.magnetic[:] = newB
         self.direction[:] = newDir
-
         self.update_views()
         self.update_plots()
 
-    def update_views(self):
-        """Render the point mesh for E, B, and overlay views."""
-        # Base gray cloud
-        grey_cloud = pv.PolyData(self.cloud.points)
+    def reset(self):
+        """Reset all fields, directions, and history."""
+        self._reset_fields()
+        self.e_history.clear()
+        self.m_history.clear()
+        self.update_views()
+        self.update_plots()
 
-        # Electric view: gray + blue points
+    def _reset_fields(self):
+        """Helper to clear bits and directions."""
+        self.electric[:] = 0
+        self.magnetic[:] = 0
+        self.direction[:] = 0
+
+    def update_views(self):
+        grey_cloud = pv.PolyData(self.cloud.points)
+        # Electric view
         self.e3d.clear()
         self.e3d.add_mesh(grey_cloud, color="lightgray",
                           render_points_as_spheres=True, point_size=8)
         e_mask = self.electric.astype(bool)
         if e_mask.any():
-            pts_e = pv.PolyData(self.cloud.points[e_mask])
-            self.e3d.add_mesh(pts_e, color="blue",
-                              render_points_as_spheres=True, point_size=8)
+            self.e3d.add_mesh(pv.PolyData(self.cloud.points[e_mask]),
+                              color="blue", render_points_as_spheres=True, point_size=8)
         self.e3d.render()
-
-        # Magnetic view: gray + red points
+        # Magnetic view
         self.m3d.clear()
         self.m3d.add_mesh(grey_cloud, color="lightgray",
                           render_points_as_spheres=True, point_size=8)
         m_mask = self.magnetic.astype(bool)
         if m_mask.any():
-            pts_m = pv.PolyData(self.cloud.points[m_mask])
-            self.m3d.add_mesh(pts_m, color="red",
-                              render_points_as_spheres=True, point_size=8)
+            self.m3d.add_mesh(pv.PolyData(self.cloud.points[m_mask]),
+                              color="red", render_points_as_spheres=True, point_size=8)
         self.m3d.render()
-
-        # Overlay view: gray + blue + red
+        # Overlay view
         self.o3d.clear()
         self.o3d.add_mesh(grey_cloud, color="lightgray",
                           render_points_as_spheres=True, point_size=8)
@@ -198,22 +192,18 @@ class EMFieldApp(QtWidgets.QMainWindow):
         self.o3d.render()
 
     def update_plots(self):
-        """Update oscilloscope plots for E, B, and overlay."""
         self.e_history.append(int(self.electric[self.center_idx]))
         self.m_history.append(int(self.magnetic[self.center_idx]))
         t = np.arange(len(self.e_history))
-
-        # E plot
+        # Electric
         self.ax_e.clear()
         self.ax_e.plot(t, self.e_history, color="blue")
         self.canv_e.draw()
-
-        # B plot
+        # Magnetic
         self.ax_m.clear()
         self.ax_m.plot(t, self.m_history, color="red")
         self.canv_m.draw()
-
-        # Overlay plot
+        # Overlay
         self.ax_o.clear()
         self.ax_o.plot(t, self.e_history, color="blue", label="E")
         self.ax_o.plot(t, self.m_history, color="red", label="B")
@@ -221,9 +211,8 @@ class EMFieldApp(QtWidgets.QMainWindow):
         self.canv_o.draw()
 
     def debug_values(self):
-        """Show current active E/B coordinates."""
         half = GRID_SIZE // 2
-        coords = np.indices((GRID_SIZE,)*3).reshape(3, -1).T - half
+        coords = np.indices((GRID_SIZE,)*3).reshape(3,-1).T - half
         e_idx = np.nonzero(self.electric)[0]
         m_idx = np.nonzero(self.magnetic)[0]
         e_pos = tuple(coords[e_idx[0]]) if e_idx.size else None
@@ -234,7 +223,6 @@ class EMFieldApp(QtWidgets.QMainWindow):
         )
 
     def make_wave(self, title, color):
-        """Helper to create a matplotlib FigureCanvas for oscilloscope."""
         fig = Figure(figsize=(4,2))
         ax = fig.add_subplot(111)
         ax.set_title(title)
